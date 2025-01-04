@@ -1,18 +1,24 @@
 #include <WiFi.h>
-#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include "esp_camera.h"
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
 
+// WiFi credentials
 const char* ssid = "RoboAI";
 const char* password = "11235813";
 
+// Server details
+const char* serverUrl = "https://roboict.duckdns.org";
 
+// GPS configuration
 static const int GPS_RX = 13;
 static const int GPS_TX = 12;
 static const uint32_t GPS_BAUD = 9600;
 
+// Camera configuration - AI Thinker
 #define CAMERA_MODEL_AI_THINKER
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -31,60 +37,64 @@ static const uint32_t GPS_BAUD = 9600;
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-WebServer server(80);
+// Global objects
 TinyGPSPlus gps;
 SoftwareSerial gpsSerial(GPS_RX, GPS_TX);
+WiFiClientSecure client;
 
-void handleGPS() {
-  String json = "";
-  if (gps.location.isValid()) {
-    json = "{\"lat\":" + String(gps.location.lat(), 6) + 
-           ",\"lng\":" + String(gps.location.lng(), 6) + 
-           ",\"alt\":" + String(gps.altitude.meters()) + 
-           ",\"speed\":" + String(gps.speed.kmph()) + 
-           ",\"sats\":" + String(gps.satellites.value()) + "}";
-  } else {
-    json = "{\"error\":\"No GPS fix\"}";
-  }
-  server.send(200, "application/json", json);
-}
-
-void handleStream() {
-  WiFiClient client = server.client();
-  
-  String response = "HTTP/1.1 200 OK\r\n";
-  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  client.print(response);
-
-  while (client.connected()) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      continue;
-    }
-
-    String header = "--frame\r\n";
-    header += "Content-Type: image/jpeg\r\n\r\n";
-    client.print(header);
-    client.write(fb->buf, fb->len);
-    client.print("\r\n");
-    
-    esp_camera_fb_return(fb);
-    delay(100); // Adjust frame rate
-  }
-}
+// Function declarations
+void setupCamera();
+bool sendGPSData();
+bool sendFrame();
 
 void setup() {
   Serial.begin(115200);
   gpsSerial.begin(GPS_BAUD);
   
+  // Connect to WiFi
   WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
+    delay(500);
+    Serial.print(".");
   }
+  Serial.println("\nWiFi connected");
   Serial.println(WiFi.localIP());
 
+  // Skip SSL certificate verification
+  client.setInsecure();
+  
+  // Initialize camera
+  setupCamera();
+}
+
+void loop() {
+  // Update GPS data
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // Send GPS data if available
+  if (gps.location.isValid()) {
+    if (sendGPSData()) {
+      Serial.println("GPS data sent successfully");
+    } else {
+      Serial.println("Failed to send GPS data");
+    }
+  }
+
+  // Send camera frame
+  if (sendFrame()) {
+    Serial.println("Frame sent successfully");
+  } else {
+    Serial.println("Failed to send frame");
+  }
+
+  // Small delay to prevent overwhelming the server
+  delay(1000);
+}
+
+void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -115,17 +125,46 @@ void setup() {
     Serial.printf("Camera init failed with error 0x%x", err);
     return;
   }
-
-  server.enableCORS();
-  server.on("/gps", HTTP_GET, handleGPS);
-  server.on("/stream", HTTP_GET, handleStream);
-  server.begin();
+  Serial.println("Camera initialized successfully");
 }
 
-void loop() {
-  server.handleClient();
+bool sendGPSData() {
+  HTTPClient http;
+  String url = String(serverUrl) + "/api/gps";
   
-  while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  
+  String jsonData = "{\"lat\":" + String(gps.location.lat(), 6) + 
+                    ",\"lng\":" + String(gps.location.lng(), 6) + 
+                    ",\"alt\":" + String(gps.altitude.meters()) + 
+                    ",\"speed\":" + String(gps.speed.kmph()) + 
+                    ",\"satellites\":" + String(gps.satellites.value()) + "}";
+  
+  int httpCode = http.POST(jsonData);
+  bool success = (httpCode == HTTP_CODE_OK);
+  
+  http.end();
+  return success;
+}
+
+bool sendFrame() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return false;
   }
+
+  HTTPClient http;
+  String url = String(serverUrl) + "/api/stream";
+  
+  http.begin(client, url);
+  http.addHeader("Content-Type", "image/jpeg");
+  
+  int httpCode = http.POST(fb->buf, fb->len);
+  bool success = (httpCode == HTTP_CODE_OK);
+  
+  esp_camera_fb_return(fb);
+  http.end();
+  return success;
 }
