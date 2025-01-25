@@ -1,24 +1,26 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <Wire.h>
 #include "esp_camera.h"
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
+#include <ArduinoJson.h>
 
-// WiFi credentials
-const char* ssid = "RoboAI";
+// WiFi and Server Configuration
+const char* ssid = "ccn_bus";
 const char* password = "11235813";
+const char* serverName = "https://bus.roboict.com";
+const int serverPort = 443;
+const char* gpsEndpoint = "/api/gps";
+const char* streamEndpoint = "/api/stream";
 
-// Server details
-const char* serverUrl = "https://roboict.duckdns.org";
+// Timing Configuration
+const unsigned long GPS_UPDATE_INTERVAL = 500;
+const int WIFI_RETRY_DELAY = 5000;
+const int HTTP_RETRY_COUNT = 3;
+unsigned long lastGPSUpdate = 0;
 
-// GPS configuration
-static const int GPS_RX = 13;
-static const int GPS_TX = 12;
-static const uint32_t GPS_BAUD = 9600;
-
-// Camera configuration - AI Thinker
+// Camera Configuration - AI Thinker
 #define CAMERA_MODEL_AI_THINKER
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -37,61 +39,56 @@ static const uint32_t GPS_BAUD = 9600;
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// Global objects
+// Global Objects
 TinyGPSPlus gps;
-SoftwareSerial gpsSerial(GPS_RX, GPS_TX);
 WiFiClientSecure client;
+const String serverUrl = serverName;
 
-// Function declarations
-void setupCamera();
-bool sendGPSData();
-bool sendFrame();
+// Root CA Certificate
+const char* rootCACertificate = R"(
+-----BEGIN CERTIFICATE-----
+MIIEVzCCAj+gAwIBAgIRALBXPpFzlydw27SHyzpFKzgwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMjQwMzEzMDAwMDAw
+WhcNMjcwMzEyMjM1OTU5WjAyMQswCQYDVQQGEwJVUzEWMBQGA1UEChMNTGV0J3Mg
+RW5jcnlwdDELMAkGA1UEAxMCRTYwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAATZ8Z5G
+h/ghcWCoJuuj+rnq2h25EqfUJtlRFLFhfHWWvyILOR/VvtEKRqotPEoJhC6+QJVV
+6RlAN2Z17TJOdwRJ+HB7wxjnzvdxEP6sdNgA1O1tHHMWMxCcOrLqbGL0vbijgfgw
+gfUwDgYDVR0PAQH/BAQDAgGGMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcD
+ATASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBSTJ0aYA6lRaI6Y1sRCSNsj
+v1iU0jAfBgNVHSMEGDAWgBR5tFnme7bl5AFzgAiIyBpY9umbbjAyBggrBgEFBQcB
+AQQmMCQwIgYIKwYBBQUHMAKGFmh0dHA6Ly94MS5pLmxlbmNyLm9yZy8wEwYDVR0g
+BAwwCjAIBgZngQwBAgEwJwYDVR0fBCAwHjAcoBqgGIYWaHR0cDovL3gxLmMubGVu
+Y3Iub3JnLzANBgkqhkiG9w0BAQsFAAOCAgEAfYt7SiA1sgWGCIpunk46r4AExIRc
+MxkKgUhNlrrv1B21hOaXN/5miE+LOTbrcmU/M9yvC6MVY730GNFoL8IhJ8j8vrOL
+pMY22OP6baS1k9YMrtDTlwJHoGby04ThTUeBDksS9RiuHvicZqBedQdIF65pZuhp
+eDcGBcLiYasQr/EO5gxxtLyTmgsHSOVSBcFOn9lgv7LECPq9i7mfH3mpxgrRKSxH
+pOoZ0KXMcB+hHuvlklHntvcI0mMMQ0mhYj6qtMFStkF1RpCG3IPdIwpVCQqu8GV7
+s8ubknRzs+3C/Bm19RFOoiPpDkwvyNfvmQ14XkyqqKK5oZ8zhD32kFRQkxa8uZSu
+h4aTImFxknu39waBxIRXE4jKxlAmQc4QjFZoq1KmQqQg0J/1JF8RlFvJas1VcjLv
+YlvUB2t6npO6oQjB3l+PNf0DpQH7iUx3Wz5AjQCi6L25FjyE06q6BZ/QlmtYdl/8
+ZYao4SRqPEs/6cAiF+Qf5zg2UkaWtDphl1LKMuTNLotvsX99HP69V2faNyegodQ0
+LyTApr/vT01YPE46vNsDLgK+4cL6TrzC/a4WcmF5SRJ938zrv/duJHLXQIku5v0+
+EwOy59Hdm0PT/Er/84dDV0CSjdR/2XuZM3kpysSKLgD1cKiDA+IRguODCxfO9cyY
+Ig46v9mFmBvyH04=
+-----END CERTIFICATE-----
+)";
 
-void setup() {
-  Serial.begin(115200);
-  gpsSerial.begin(GPS_BAUD);
+
+bool ensureWiFiConnection() {
+  if (WiFi.isConnected()) return true;
   
-  // Connect to WiFi
+  Serial.println("WiFi disconnected. Reconnecting...");
+  WiFi.disconnect();
   WiFi.begin(ssid, password);
-  Serial.println("Connecting to WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-  Serial.println(WiFi.localIP());
-
-  // Skip SSL certificate verification
-  client.setInsecure();
   
-  // Initialize camera
-  setupCamera();
-}
-
-void loop() {
-  // Update GPS data
-  while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && 
+         millis() - startAttemptTime < WIFI_RETRY_DELAY) {
+    delay(100);
   }
-
-  // Send GPS data if available
-  if (gps.location.isValid()) {
-    if (sendGPSData()) {
-      Serial.println("GPS data sent successfully");
-    } else {
-      Serial.println("Failed to send GPS data");
-    }
-  }
-
-  // Send camera frame
-  if (sendFrame()) {
-    Serial.println("Frame sent successfully");
-  } else {
-    Serial.println("Failed to send frame");
-  }
-
-  // Small delay to prevent overwhelming the server
-  delay(1000);
+  
+  return WiFi.isConnected();
 }
 
 void setupCamera() {
@@ -129,42 +126,104 @@ void setupCamera() {
 }
 
 bool sendGPSData() {
-  HTTPClient http;
-  String url = String(serverUrl) + "/api/gps";
+  if (!ensureWiFiConnection()) return false;
+  if (!gps.location.isValid()) return false;
   
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  
-  String jsonData = "{\"lat\":" + String(gps.location.lat(), 6) + 
-                    ",\"lng\":" + String(gps.location.lng(), 6) + 
-                    ",\"alt\":" + String(gps.altitude.meters()) + 
-                    ",\"speed\":" + String(gps.speed.kmph()) + 
-                    ",\"satellites\":" + String(gps.satellites.value()) + "}";
-  
-  int httpCode = http.POST(jsonData);
-  bool success = (httpCode == HTTP_CODE_OK);
-  
-  http.end();
-  return success;
+  for (int i = 0; i < HTTP_RETRY_COUNT; i++) {
+    HTTPClient https;
+    if (!https.begin(client, serverUrl + gpsEndpoint)) {
+      Serial.println("HTTPS setup failed");
+      delay(1000);
+      continue;
+    }
+    
+    https.addHeader("Content-Type", "application/json");
+    String jsonData = "{\"lat\":" + String(gps.location.lat(), 6) + 
+                     ",\"lng\":" + String(gps.location.lng(), 6) + 
+                     ",\"alt\":" + String(gps.altitude.meters()) + 
+                     ",\"speed\":" + String(gps.speed.kmph()) + 
+                     ",\"satellites\":" + String(gps.satellites.value()) + "}";
+    
+    int httpCode = https.POST(jsonData);
+    https.end();
+    
+    if (httpCode == HTTP_CODE_OK) return true;
+    
+    Serial.printf("HTTP Error: %d (Attempt %d/%d)\n", 
+                 httpCode, i + 1, HTTP_RETRY_COUNT);
+    delay(1000);
+  }
+  return false;
 }
 
-bool sendFrame() {
+bool sendVideoFrame() {
+  if (!ensureWiFiConnection()) return false;
+  
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
     return false;
   }
-
-  HTTPClient http;
-  String url = String(serverUrl) + "/api/stream";
   
-  http.begin(client, url);
-  http.addHeader("Content-Type", "image/jpeg");
-  
-  int httpCode = http.POST(fb->buf, fb->len);
-  bool success = (httpCode == HTTP_CODE_OK);
+  bool success = false;
+  for (int i = 0; i < HTTP_RETRY_COUNT && !success; i++) {
+    HTTPClient https;
+    if (!https.begin(client, serverUrl + streamEndpoint)) {
+      Serial.println("HTTPS setup failed");
+      delay(1000);
+      continue;
+    }
+    
+    https.addHeader("Content-Type", "image/jpeg");
+    int httpCode = https.POST(fb->buf, fb->len);
+    https.end();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      success = true;
+    } else {
+      Serial.printf("HTTP Error: %d (Attempt %d/%d)\n", 
+                   httpCode, i + 1, HTTP_RETRY_COUNT);
+      delay(1000);
+    }
+  }
   
   esp_camera_fb_return(fb);
-  http.end();
   return success;
+}
+
+void setup() {
+  Serial.begin(9600);
+  
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (!ensureWiFiConnection()) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+
+  client.setCACert(rootCACertificate);
+  setupCamera();
+}
+
+void loop() {
+  // Update GPS data
+  while (Serial.available() > 0) {
+    gps.encode(Serial.read());
+  }
+
+  // Send GPS data at specified interval
+  if (millis() - lastGPSUpdate >= GPS_UPDATE_INTERVAL) {
+    if (sendGPSData()) {
+      Serial.println("GPS data sent successfully");
+    }
+    lastGPSUpdate = millis();
+  }
+
+  // Send video frame
+  if (sendVideoFrame()) {
+    Serial.println("Frame sent successfully");
+  }
+  
+  delay(100);  // Prevent overwhelming the server
 }
