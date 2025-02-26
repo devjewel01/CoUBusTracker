@@ -7,9 +7,9 @@
 #include <ArduinoJson.h>
 
 // WiFi and Server Configuration
-const char* ssid = "ccn_bus";
+const char* ssid = "cou_bus";
 const char* password = "11235813";
-const char* serverName = "https://ccnbus.roboict.com";
+const char* serverName = "https://bus.roboict.com";
 const int serverPort = 443;
 const char* gpsEndpoint = "/api/gps";
 const char* streamEndpoint = "/api/stream";
